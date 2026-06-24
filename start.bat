@@ -10,8 +10,21 @@ if not exist .venv (
 )
 
 call .venv\Scripts\activate.bat
-pip install --quiet --upgrade pip
-pip install --quiet -r requirements.txt
+REM Апгрейд pip необязателен и может падать за прокси — не считаем это ошибкой.
+python -m pip install --upgrade pip >nul 2>&1
+echo Устанавливаю зависимости (первый раз — пару минут)...
+python -m pip install -r requirements.txt
+if errorlevel 1 (
+  echo.
+  echo [ОШИБКА] Не удалось установить зависимости.
+  echo Скорее всего мешает прокси/сеть. Попробуйте:
+  echo   1^) Раздать интернет с телефона ^(мобильная точка^) и запустить заново.
+  echo   2^) Либо открыть PowerShell в этой папке и выполнить:
+  echo      $env:HTTP_PROXY=""; $env:HTTPS_PROXY=""; backend\.venv\Scripts\python -m pip install -r backend\requirements.txt
+  echo.
+  pause
+  exit /b 1
+)
 
 start "Сервис подписания актов" /min cmd /c "python -m uvicorn app.main:app --host 127.0.0.1 --port %PORT% > ..\service.log 2>&1"
 
