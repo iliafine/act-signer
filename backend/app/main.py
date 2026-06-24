@@ -169,14 +169,23 @@ def _convert_to_pdf(docx_path: Path, out_dir: Path) -> Path:
         # Отдельный профиль на каждый вызов: параллельные/быстрые подряд
         # запуски soffice конфликтуют за общий профиль и портят результат.
         # as_uri() даёт корректный file:// и на Windows (file:///C:/...), и на *nix.
-        result = subprocess.run(
-            [
-                soffice, "--headless", "--norestore",
-                f"-env:UserInstallation={Path(profile_dir).as_uri()}",
-                "--convert-to", "pdf", "--outdir", str(out_dir), str(docx_path),
-            ],
-            capture_output=True, text=True, timeout=120,
-        )
+        # Доп. флаги (--nolockcheck/--nodefault/--nofirststartwizard/--invisible)
+        # критичны на Windows: иначе headless-конвертация может зависнуть, если
+        # уже открыт LibreOffice или при самом первом запуске.
+        cmd = [
+            soffice, "--headless", "--invisible", "--norestore",
+            "--nolockcheck", "--nodefault", "--nofirststartwizard",
+            f"-env:UserInstallation={Path(profile_dir).as_uri()}",
+            "--convert-to", "pdf", "--outdir", str(out_dir), str(docx_path),
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        except subprocess.TimeoutExpired:
+            raise HTTPException(
+                status_code=500,
+                detail="LibreOffice не ответил за 90 сек (возможно, открыт другой документ "
+                       "LibreOffice — закройте все его окна и повторите). Либо выберите формат DOCX.",
+            )
     pdf_path = out_dir / (docx_path.stem + ".pdf")
     if result.returncode != 0 or not pdf_path.exists():
         raise HTTPException(status_code=500, detail=f"Не удалось конвертировать в PDF: {result.stderr}")
