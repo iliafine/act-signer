@@ -1,0 +1,18 @@
+INFO:     Started server process [36418]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8743 (Press CTRL+C to quit)
+INFO:     127.0.0.1:53596 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53596 - "GET /api/signers HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53596 - "GET /api/signers/2/signature HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53597 - "GET /api/signers/3/signature HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53602 - "GET /api/signers/5/signature HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53603 - "GET /api/signers/6/signature HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53604 - "GET /api/signers/7/signature HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53605 - "GET /api/signers/8/signature HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53676 - "POST /api/sign HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56481 - "POST /api/sign HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [36418]
