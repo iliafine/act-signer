@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Виртуальное окружение бэкенда
+backend/.venv/
+
+# Рантайм-артефакты сервиса (создаются при работе, не нужны в репозитории)
+*.pid
+.service.pid
+*.log
+service.log
+backend/app/_last_output/
+
+# Временные/тестовые данные
+test_data/
+signatures_raw/
+
+# ОС и IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp

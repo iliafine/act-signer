@@ -31,6 +31,7 @@ class Signer:
     aliases: list[str] = field(default_factory=list)
     file: str = ""  # имя файла внутри SIGNATURES_DIR
     scale: float = 1.0  # множитель размера подписи (для размашистых росчерков)
+    vertical_offset_frac: float = 0.0  # сдвиг вниз относительно "полки" в долях высоты подписи
 
     def signature_path(self) -> Path:
         return SIGNATURES_DIR / self.file

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import io
+import json
 import shutil
 import subprocess
+import uuid
 import tempfile
 import zipfile
 from urllib.parse import quote
 from dataclasses import asdict
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -40,6 +42,86 @@ def _report_to_dict(report: SignReport) -> dict:
     }
 
 
+def _is_usable_docx(path: Path) -> bool:
+    """Отсекает служебные файлы macOS из zip: __MACOSX и ._*.docx не являются Word-документами."""
+    return (
+        path.suffix.lower() == ".docx"
+        and not path.name.startswith("._")
+        and "__MACOSX" not in path.parts
+    )
+
+
+def _decode_zip_name(name: str) -> str:
+    """Восстанавливает кириллицу из zip без UTF-8-флага."""
+    try:
+        raw = name.encode("cp437")
+    except UnicodeEncodeError:
+        return name
+    for encoding in ("utf-8", "cp866"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+    return name
+
+
+def _safe_extract_zip(zip_path: Path, extract_dir: Path) -> None:
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            decoded_name = _decode_zip_name(info.filename)
+            rel = PurePosixPath(decoded_name)
+            if rel.is_absolute() or ".." in rel.parts:
+                continue
+
+            target = extract_dir.joinpath(*rel.parts)
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(zf.read(info))
+
+
+def _prefixed_output_path(output_dir: Path, rel: Path, export_format: str) -> Path:
+    suffix = ".pdf" if export_format == "pdf" else rel.suffix
+    return output_dir / rel.with_name(f"Подписанный {rel.stem}{suffix}")
+
+
+def _report_status_label(status: str) -> str:
+    return {
+        "not_found_in_db": "нет в базе",
+        "no_target_location": "не найдено место для подписи",
+        "signed": "подписано",
+    }.get(status, status)
+
+
+def _friendly_error(error: Exception) -> str:
+    if type(error).__name__ == "PackageNotFoundError":
+        return "файл не похож на настоящий .docx-документ Word"
+    return f"{type(error).__name__}: {error}"
+
+
+def _write_issue_report(report_path: Path, issues: list[dict]) -> None:
+    if not issues:
+        return
+
+    lines = ["Отчет по подписанию", ""]
+    for issue in issues:
+        lines.append(f"Файл: {issue['file']}")
+        if issue.get("error"):
+            lines.append(f"Ошибка: {issue['error']}")
+        for result in issue.get("results", []):
+            role = " ".join((result.get("role_text") or "").split())
+            status = _report_status_label(result.get("status", ""))
+            signer = result.get("matched_signer") or "не найден"
+            lines.append(f"- {status}: {signer}")
+            if role:
+                lines.append(f"  Роль: {role}")
+        lines.append("")
+
+    report_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     html_path = STATIC_DIR / "index.html"
@@ -51,23 +133,46 @@ def list_signers() -> JSONResponse:
     return JSONResponse([asdict(s) for s in load_db()])
 
 
+def _find_soffice() -> str | None:
+    """Ищет LibreOffice кросс-платформенно. На Windows soffice обычно не в PATH,
+    поэтому проверяем стандартные пути установки; на macOS — бандл приложения."""
+    found = shutil.which("soffice") or shutil.which("libreoffice")
+    if found:
+        return found
+    candidates = [
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        "/usr/bin/soffice",
+        "/usr/local/bin/soffice",
+        "/opt/homebrew/bin/soffice",
+    ]
+    for path in candidates:
+        if Path(path).exists():
+            return path
+    return None
+
+
 def _convert_to_pdf(docx_path: Path, out_dir: Path) -> Path:
     """Конвертирует .docx в .pdf через LibreOffice headless. Делаем это уже
     из подписанного документа, поэтому "плавающая" подпись (наложенная на
     текст) сохраняется и в PDF — в отличие от вставки картинки прямо в PDF."""
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    soffice = _find_soffice()
     if not soffice:
         raise HTTPException(
             status_code=500,
-            detail="Для экспорта в PDF на сервере должен быть установлен LibreOffice (soffice)",
+            detail="Для экспорта в PDF нужен установленный LibreOffice. "
+                   "Скачайте с libreoffice.org и установите, затем повторите. "
+                   "Без него экспорт в .docx работает как обычно.",
         )
     with tempfile.TemporaryDirectory() as profile_dir:
         # Отдельный профиль на каждый вызов: параллельные/быстрые подряд
         # запуски soffice конфликтуют за общий профиль и портят результат.
+        # as_uri() даёт корректный file:// и на Windows (file:///C:/...), и на *nix.
         result = subprocess.run(
             [
                 soffice, "--headless", "--norestore",
-                f"-env:UserInstallation=file://{profile_dir}",
+                f"-env:UserInstallation={Path(profile_dir).as_uri()}",
                 "--convert-to", "pdf", "--outdir", str(out_dir), str(docx_path),
             ],
             capture_output=True, text=True, timeout=120,
@@ -106,7 +211,7 @@ async def create_signer(
         raw_path = Path(tmp) / scan.filename
         raw_path.write_bytes(await scan.read())
 
-        out_name = f"sig_{full_name.strip().replace(' ', '_')}.png"
+        out_name = f"sig_{uuid.uuid4().hex}.png"  # ASCII-имя: ФИО бывает кириллическим, ломает перенос на Windows
         out_path = SIGNATURES_DIR / out_name
         try:
             _extract_with_fallback(raw_path, out_path)
@@ -140,7 +245,7 @@ async def edit_signer(
         with tempfile.TemporaryDirectory() as tmp:
             raw_path = Path(tmp) / scan.filename
             raw_path.write_bytes(await scan.read())
-            out_name = f"sig_{full_name.strip().replace(' ', '_')}.png"
+            out_name = f"sig_{uuid.uuid4().hex}.png"  # ASCII-имя: ФИО бывает кириллическим, ломает перенос на Windows
             out_path = SIGNATURES_DIR / out_name
             try:
                 _extract_with_fallback(raw_path, out_path)
@@ -169,7 +274,7 @@ def get_signature_image(signer_id: str):
 
 @app.post("/api/sign")
 async def sign_act(file: UploadFile = File(...), export_format: str = Form("docx")):
-    filename = file.filename or "act"
+    filename = Path(file.filename or "act").name
     suffix = Path(filename).suffix.lower()
     content = await file.read()
     export_format = export_format.lower().strip()
@@ -184,27 +289,37 @@ async def sign_act(file: UploadFile = File(...), export_format: str = Form("docx
             in_zip_path.write_bytes(content)
             extract_dir = tmp_path / "extracted"
             extract_dir.mkdir()
-            with zipfile.ZipFile(in_zip_path) as zf:
-                zf.extractall(extract_dir)
+            _safe_extract_zip(in_zip_path, extract_dir)
 
             output_dir = tmp_path / "output"
             output_dir.mkdir()
-            full_report: dict[str, dict] = {}
+            issues: list[dict] = []
 
-            for docx_file in extract_dir.rglob("*.docx"):
+            docx_files = [path for path in extract_dir.rglob("*.docx") if _is_usable_docx(path.relative_to(extract_dir))]
+            if not docx_files:
+                raise HTTPException(status_code=400, detail="В zip не найдено настоящих .docx-файлов")
+
+            for docx_file in docx_files:
                 rel = docx_file.relative_to(extract_dir)
-                out_file = output_dir / rel
-                report = sign_document(str(docx_file), str(out_file))
-                full_report[str(rel)] = _report_to_dict(report)
+                out_file = _prefixed_output_path(output_dir, rel, export_format)
+                try:
+                    signed_docx = out_file.with_suffix(".docx") if export_format == "pdf" else out_file
+                    report = sign_document(str(docx_file), str(signed_docx))
+                    report_dict = _report_to_dict(report)
+                    if not report.all_signed:
+                        issues.append({"file": str(rel), "results": report_dict["results"]})
 
-                if export_format == "pdf":
-                    pdf_path = _convert_to_pdf(out_file, out_file.parent)
-                    out_file.unlink()
-                    pdf_path.rename(out_file.with_suffix(".pdf"))
+                    if export_format == "pdf":
+                        pdf_path = _convert_to_pdf(signed_docx, signed_docx.parent)
+                        signed_docx.unlink()
+                        if pdf_path != out_file:
+                            if out_file.exists():
+                                out_file.unlink()
+                            pdf_path.rename(out_file)
+                except Exception as e:  # noqa: BLE001
+                    issues.append({"file": str(rel), "error": _friendly_error(e)})
 
-            (output_dir / "_report.json").write_text(
-                __import__("json").dumps(full_report, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            _write_issue_report(output_dir / "Отчет.txt", issues)
 
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -220,13 +335,13 @@ async def sign_act(file: UploadFile = File(...), export_format: str = Form("docx
             return Response(
                 content=zip_buf.read(),
                 media_type="application/zip",
-                headers={"Content-Disposition": 'attachment; filename="signed_acts.zip"'},
+                headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote('Подписанные акты.zip')}"},
             )
 
         elif suffix == ".docx":
             in_path = tmp_path / filename
             in_path.write_bytes(content)
-            out_path = tmp_path / f"signed_{filename}"
+            out_path = tmp_path / f"Подписанный {filename}"
             report = sign_document(str(in_path), str(out_path))
 
             persisted = STATIC_DIR.parent / "_last_output"
@@ -245,7 +360,7 @@ async def sign_act(file: UploadFile = File(...), export_format: str = Form("docx
                 media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
             response = FileResponse(str(final_path), filename=final_name, media_type=media_type)
-            report_json = __import__("json").dumps(_report_to_dict(report), ensure_ascii=False)
+            report_json = json.dumps(_report_to_dict(report), ensure_ascii=False)
             response.headers["X-Sign-Report"] = quote(report_json)
             return response
         else:

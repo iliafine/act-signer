@@ -335,10 +335,10 @@ async function signAct() {
   // Content-Disposition (для кириллицы там RFC5987-кодировка).
   let name;
   if (f.name.toLowerCase().endsWith('.zip')) {
-    name = 'signed_acts.zip';
+    name = 'Подписанные акты.zip';
   } else {
     const base = f.name.replace(/\.[^.]+$/, '');
-    name = 'signed_' + base + (fmt === 'pdf' ? '.pdf' : '.docx');
+    name = 'Подписанный ' + base + (fmt === 'pdf' ? '.pdf' : '.docx');
   }
 
   let html = `<a class="download-link" href="${url}" download="${name}">⬇ Скачать: ${name}</a>`;

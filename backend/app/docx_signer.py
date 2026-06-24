@@ -143,12 +143,66 @@ def find_signer_slots(document: DocumentType) -> list[SignerSlot]:
                     )
                 )
 
-    paragraph_slots = _find_paragraph_slots_by_caption(document)
-    if not paragraph_slots:
+    caption_slots = _find_paragraph_slots_by_caption(document)
+    if caption_slots:
+        # Последний подписант в акте часто идёт БЕЗ подписи-подсказки
+        # "(фамилия, инициалы, подпись)" — добираем такие блоки роль→ФИО.
+        paragraph_slots = caption_slots + _find_paragraph_slots_uncaptioned(document, caption_slots)
+    else:
         paragraph_slots = _find_paragraph_slots_by_heuristic(document)
     slots.extend(paragraph_slots)
 
     return slots
+
+
+def _find_paragraph_slots_uncaptioned(
+    document: DocumentType, caption_slots: list[SignerSlot]
+) -> list[SignerSlot]:
+    """Добирает блоки подписантов, у которых нет подписи-подсказки
+    "(фамилия, инициалы, подпись)" (типично — самый последний подписант).
+    Ищем только в зоне подписей (с первого найденного по caption блока и
+    ниже), и только пары «роль-описание → короткая строка с ФИО», чтобы не
+    зацепить упоминания должностей в шапке акта (там после роли идёт длинная
+    строка с наименованием организации, а не одно ФИО)."""
+    paragraphs = document.paragraphs
+    region_start = min(s.paragraph_idx for s in caption_slots)
+    used_roles = {s.paragraph_idx for s in caption_slots}
+    used_names = {s.target_paragraph_idx for s in caption_slots}
+
+    extra: list[SignerSlot] = []
+    for idx in range(region_start, len(paragraphs)):
+        if idx in used_roles:
+            continue
+        role_text = paragraphs[idx].text.strip()
+        if not _is_role_like(role_text) or _is_pure_name(role_text):
+            continue
+
+        name_idx = idx + 1
+        while name_idx < len(paragraphs) and not paragraphs[name_idx].text.strip():
+            name_idx += 1
+        if name_idx >= len(paragraphs) or name_idx in used_names:
+            continue
+
+        name_para_text = paragraphs[name_idx].text.strip()
+        name = _extract_name(name_para_text)
+        # следующая строка должна быть именно коротким ФИО (печатная фамилия
+        # с инициалами), а не длинным описанием из шапки акта
+        if not name or len(name_para_text) > 40:
+            continue
+
+        extra.append(
+            SignerSlot(
+                role_text=role_text,
+                kind="paragraph",
+                name_text=name,
+                paragraph_idx=idx,
+                target_paragraph_idx=name_idx,
+            )
+        )
+        used_roles.add(idx)
+        used_names.add(name_idx)
+
+    return extra
 
 
 def _find_paragraph_slots_by_caption(document: DocumentType) -> list[SignerSlot]:
@@ -339,7 +393,11 @@ def _insert_image_in_cell(cell: _Cell, image_path: str, scale: float = 1.0) -> N
 
 
 def _insert_floating_image_in_paragraph(
-    document: DocumentType, paragraph_idx: int, image_path: str, scale: float = 1.0
+    document: DocumentType,
+    paragraph_idx: int,
+    image_path: str,
+    scale: float = 1.0,
+    vertical_offset_frac: float = 0.0,
 ) -> None:
     """Вставляет подпись плавающей картинкой в строку с ФИО, сидя на линии
     ("полке"). Если ФИО слева — подпись справа от него; если ФИО выровнено
@@ -358,7 +416,7 @@ def _insert_floating_image_in_paragraph(
 
     # Y: габаритный низ подписи садится на полку (с небольшим хвостом вниз).
     # Этот вариант проверен — при нём Рожин/Кудлай ложатся ровно на линию.
-    bottom_cm = SIG_LINE_OFFSET_CM + SIG_BELOW_LINE_CM
+    bottom_cm = SIG_LINE_OFFSET_CM + SIG_BELOW_LINE_CM + height_cm * vertical_offset_frac
     _make_floating(run, offset_x_emu=offset_x.emu, offset_y_emu=Cm(bottom_cm - height_cm).emu)
 
 
@@ -406,7 +464,13 @@ def sign_document(input_path: str, output_path: str, signers_db: list[Signer] | 
             _insert_image_in_cell(cell, str(sig_path), scale=matched.scale)
         else:
             insert_after = slot.target_paragraph_idx if slot.target_paragraph_idx is not None else slot.paragraph_idx
-            _insert_floating_image_in_paragraph(document, insert_after, str(sig_path), scale=matched.scale)
+            _insert_floating_image_in_paragraph(
+                document,
+                insert_after,
+                str(sig_path),
+                scale=matched.scale,
+                vertical_offset_frac=matched.vertical_offset_frac,
+            )
 
         report.results.append(
             SignResult(role_text=slot.role_text, status="signed", matched_signer=matched, match_score=score, matched_by=matched_by)
